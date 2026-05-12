@@ -6,8 +6,6 @@ const fs = require("fs");
 const path = require("path");
 require("dotenv").config();
 
-const { GoogleGenerativeAI } = require("@google/generative-ai");
-
 const app = express();
 
 app.use(cors({ origin: "*", methods: ["GET", "POST"] }));
@@ -21,7 +19,7 @@ const upload = multer({
   limits: { fileSize: 20 * 1024 * 1024 },
 });
 
-const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-4.1-mini";
 
 let paperChunks = [];
 let paperText = "";
@@ -109,6 +107,48 @@ function extractCitationLines(text) {
     .slice(0, 10);
 }
 
+async function generateOpenAIText(prompt) {
+  if (!process.env.OPENAI_API_KEY) {
+    const error = new Error("OpenAI API key missing");
+    error.statusCode = 500;
+    throw error;
+  }
+
+  const response = await fetch("https://api.openai.com/v1/responses", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      model: OPENAI_MODEL,
+      input: prompt,
+    }),
+  });
+
+  const data = await response.json();
+
+  if (!response.ok) {
+    const error = new Error(
+      data.error?.message || `OpenAI request failed with ${response.status}`
+    );
+    error.statusCode = response.status;
+    throw error;
+  }
+
+  if (typeof data.output_text === "string") {
+    return data.output_text;
+  }
+
+  const text = data.output
+    ?.flatMap((item) => item.content || [])
+    .filter((content) => content.type === "output_text")
+    .map((content) => content.text)
+    .join("\n");
+
+  return text || "";
+}
+
 app.post("/upload", upload.single("file"), async (req, res) => {
   let filePath;
 
@@ -162,8 +202,8 @@ app.post("/analyze", async (req, res) => {
       return res.status(400).json({ error: "Upload a research paper first" });
     }
 
-    if (!process.env.GEMINI_API_KEY) {
-      return res.status(500).json({ error: "Gemini API key missing" });
+    if (!process.env.OPENAI_API_KEY) {
+      return res.status(500).json({ error: "OpenAI API key missing" });
     }
 
     const topChunks = vectorSearch(
@@ -209,28 +249,23 @@ Citation-like lines:
 ${citationLines.join("\n")}
 `;
 
-    const model = genAI.getGenerativeModel({
-      model: "gemini-2.0-flash",
-    });
-
-    const result = await model.generateContent(prompt);
-    const response = await result.response;
+    const analysis = await generateOpenAIText(prompt);
 
     return res.json({
-      analysis: response.text(),
+      analysis,
       fileName: paperName,
       chunksUsed: topChunks.length,
       citations: citationLines,
     });
   } catch (error) {
-    if (error.message && error.message.includes("429")) {
+    if (error.statusCode === 429 || (error.message && error.message.includes("429"))) {
       return res.status(429).json({
         error:
-          "Gemini quota exceeded. Try again later or use another Gemini API key.",
+          "OpenAI quota exceeded. Try again later or use another OpenAI API key.",
       });
     }
 
-    return res.status(500).json({
+    return res.status(error.statusCode || 500).json({
       error: "Analysis failed",
       details: error.message,
     });
@@ -249,6 +284,10 @@ app.post("/ask", async (req, res) => {
       return res.status(400).json({ error: "Upload a research paper first" });
     }
 
+    if (!process.env.OPENAI_API_KEY) {
+      return res.status(500).json({ error: "OpenAI API key missing" });
+    }
+
     const relevant = vectorSearch(question, paperChunks, 5);
     const context = relevant.map((item) => item.chunk).join("\n\n");
 
@@ -263,25 +302,20 @@ Question:
 ${question}
 `;
 
-    const model = genAI.getGenerativeModel({
-      model: "gemini-2.0-flash",
-    });
-
-    const result = await model.generateContent(prompt);
-    const response = await result.response;
+    const answer = await generateOpenAIText(prompt);
 
     return res.json({
-      answer: response.text(),
+      answer,
     });
   } catch (error) {
-    if (error.message && error.message.includes("429")) {
+    if (error.statusCode === 429 || (error.message && error.message.includes("429"))) {
       return res.status(429).json({
         error:
-          "Gemini quota exceeded. Try again later or use another Gemini API key.",
+          "OpenAI quota exceeded. Try again later or use another OpenAI API key.",
       });
     }
 
-    return res.status(500).json({
+    return res.status(error.statusCode || 500).json({
       error: "Question answering failed",
       details: error.message,
     });
